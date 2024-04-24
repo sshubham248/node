@@ -230,6 +230,7 @@ class MaglevGraphBuilder {
   void SetArgument(int i, ValueNode* value);
   void InitializeRegister(interpreter::Register reg, ValueNode* value);
   ValueNode* GetTaggedArgument(int i);
+  ValueNode* GetInlinedTaggedArgument(int i);
   void BuildRegisterFrameInitialization(ValueNode* context = nullptr,
                                         ValueNode* closure = nullptr,
                                         ValueNode* new_target = nullptr);
@@ -421,9 +422,13 @@ class MaglevGraphBuilder {
   bool CheckStaticType(ValueNode* node, NodeType type, NodeType* old = nullptr);
   bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr);
   bool EnsureType(ValueNode* node, NodeType type, NodeType* old = nullptr);
+
   template <typename Function>
   bool EnsureType(ValueNode* node, NodeType type, Function ensure_new_type);
-  void SetKnownValue(ValueNode* node, compiler::ObjectRef constant);
+  bool MayBeNullOrUndefined(ValueNode* node);
+
+  void SetKnownValue(ValueNode* node, compiler::ObjectRef constant,
+                     NodeType new_node_type);
   bool ShouldEmitInterruptBudgetChecks() {
     if (is_inline()) return false;
     return v8_flags.force_emit_interrupt_budget_checks || v8_flags.turbofan;
@@ -937,6 +942,9 @@ class MaglevGraphBuilder {
   template <typename NodeT>
   void AttachEagerDeoptInfo(NodeT* node) {
     if constexpr (NodeT::kProperties.can_eager_deopt()) {
+      // This check prevents us from speculating during builtin inlining when we
+      // shouldn't. Doing so could lead to deopt loops.
+      DCHECK_EQ(current_speculation_mode_, SpeculationMode::kAllowSpeculation);
       node->SetEagerDeoptInfo(zone(), GetLatestCheckpointedFrame(),
                               current_speculation_feedback_);
     }
@@ -997,6 +1005,8 @@ class MaglevGraphBuilder {
                                      ContextSlotMutability slot_mutability);
   void StoreAndCacheContextSlot(ValueNode* context, int offset,
                                 ValueNode* value);
+  ValueNode* TryGetParentContext(ValueNode* node);
+  void MinimizeContextChainDepth(ValueNode** context, size_t* depth);
   void BuildLoadContextSlot(ValueNode* context, size_t depth, int slot_index,
                             ContextSlotMutability slot_mutability);
   void BuildStoreContextSlotHelper(ValueNode* context, size_t depth,
@@ -1007,7 +1017,7 @@ class MaglevGraphBuilder {
   void BuildStoreScriptContextSlot(ValueNode* context, size_t depth,
                                    int slot_index, ValueNode* value);
 
-  void BuildStoreReceiverMap(ValueNode* receiver, compiler::MapRef map);
+  void BuildStoreMap(ValueNode* object, compiler::MapRef map);
 
   template <Builtin kBuiltin>
   CallBuiltin* BuildCallBuiltin(std::initializer_list<ValueNode*> inputs) {
@@ -1517,7 +1527,7 @@ class MaglevGraphBuilder {
         std::is_same_v<NodeT, StoreFixedDoubleArrayElement>;
 
     static constexpr bool is_elements_array_write =
-        std::is_same_v<NodeT, MaybeGrowAndEnsureWritableFastElements> ||
+        std::is_same_v<NodeT, MaybeGrowFastElements> ||
         std::is_same_v<NodeT, EnsureWritableFastElements>;
 
     if constexpr (is_elements_array_write) {
@@ -1703,6 +1713,9 @@ class MaglevGraphBuilder {
   V(DataViewPrototypeSetFloat64)   \
   V(FunctionPrototypeCall)         \
   V(FunctionPrototypeHasInstance)  \
+  V(ObjectPrototypeGetProto)       \
+  V(ObjectGetPrototypeOf)          \
+  V(ReflectGetPrototypeOf)         \
   V(ObjectPrototypeHasOwnProperty) \
   V(MathCeil)                      \
   V(MathFloor)                     \
@@ -1722,6 +1735,8 @@ class MaglevGraphBuilder {
                                CallArguments& args);
   MAGLEV_REDUCED_BUILTIN(DEFINE_BUILTIN_REDUCER)
 #undef DEFINE_BUILTIN_REDUCER
+
+  ReduceResult TryReduceGetProto(ValueNode* node);
 
   template <typename MapKindsT, typename IndexToElementsKindFunc,
             typename BuildKindSpecificFunc>
@@ -2021,38 +2036,46 @@ class MaglevGraphBuilder {
       compiler::FeedbackSource feedback_source);
 
   InlinedAllocation* ExtendOrReallocateCurrentAllocationBlock(
-      int size, AllocationType allocation_type, DeoptObject value);
+      AllocationType allocation_type, CapturedAllocation value);
   void ClearCurrentAllocationBlock();
 
   inline void AddDeoptUse(ValueNode* node) {
     if (InlinedAllocation* alloc = node->TryCast<InlinedAllocation>()) {
       AddNonEscapingUses(alloc, 1);
+      AddDeoptUse(alloc->captured_allocation());
     }
     node->add_use();
   }
+  void AddDeoptUse(const CapturedAllocation& alloc);
   void AddNonEscapingUses(InlinedAllocation* allocation, int use_count);
 
   ReduceResult TryBuildFastCreateObjectOrArrayLiteral(
       const compiler::LiteralFeedback& feedback);
-  base::Optional<FastObject> TryReadBoilerplateForFastLiteral(
+  base::Optional<CapturedObject> TryReadBoilerplateForFastLiteral(
       compiler::JSObjectRef boilerplate, AllocationType allocation,
       int max_depth, int* max_properties);
-  ValueNode* BuildAllocateFastObject(FastObject object,
-                                     AllocationType allocation);
-  ValueNode* BuildAllocateFastObject(FastField value,
-                                     AllocationType allocation);
-  ValueNode* BuildAllocateFastObject(FastFixedArray array,
-                                     AllocationType allocation);
 
-  ValueNode* BuildArgumentsElements(FastArgumentsObject arguments,
-                                    ValueNode* arguments_length,
+  ValueNode* GetValueNodeFromCapturedValue(CapturedValue& value);
+  ValueNode* BuildInlinedAllocation(Float64 number, AllocationType allocation);
+  ValueNode* BuildInlinedAllocation(CapturedFixedDoubleArray array,
                                     AllocationType allocation);
-  template <CreateArgumentsType type>
-  ValueNode* BuildAllocateFastObject(FastArgumentsObject arguments,
-                                     AllocationType allocation);
+  ValueNode* BuildInlinedAllocation(CapturedObject object,
+                                    AllocationType allocation);
+
+  CapturedValue BuildInlinedArgumentsElements(int start_index, int length);
+  CapturedValue BuildInlinedUnmappedArgumentsElements(int mapped_count);
 
   template <CreateArgumentsType type>
-  ValueNode* BuildArgumentsObject();
+  CapturedObject BuildCapturedArgumentsObject();
+  template <CreateArgumentsType type>
+  ValueNode* BuildAndAllocateArgumentsObject();
+
+  bool CanAllocateSloppyArgumentElements();
+  bool CanAllocateInlinedArgumentElements();
+
+  ReduceResult TryBuildInlinedAllocatedContext(compiler::MapRef map,
+                                               compiler::ScopeInfoRef scope,
+                                               int context_length);
 
   template <Operation kOperation>
   void BuildGenericUnaryOperationNode();
@@ -2132,6 +2155,12 @@ class MaglevGraphBuilder {
   ValueNode* Select(FTrue if_true, FFalse if_false,
                     std::initializer_list<ValueNode*> control_inputs,
                     Args&&... args);
+
+  template <typename ControlNodeT, typename FTrue, typename FFalse,
+            typename... Args>
+  ReduceResult SelectReduction(FTrue if_true, FFalse if_false,
+                               std::initializer_list<ValueNode*> control_inputs,
+                               Args&&... args);
 
   void CalculatePredecessorCounts() {
     // Add 1 after the end of the bytecode so we can always write to the offset
@@ -2237,7 +2266,7 @@ class MaglevGraphBuilder {
     return bytecode_analysis_;
   }
   int parameter_count() const { return compilation_unit_->parameter_count(); }
-  int parameter_count_without_receiver() { return parameter_count() - 1; }
+  int parameter_count_without_receiver() const { return parameter_count() - 1; }
   int register_count() const { return compilation_unit_->register_count(); }
   KnownNodeAspects& known_node_aspects() {
     return *current_interpreter_frame_.known_node_aspects();
@@ -2247,6 +2276,16 @@ class MaglevGraphBuilder {
   // function.
   bool is_inline() const { return parent_ != nullptr; }
   int inlining_depth() const { return compilation_unit_->inlining_depth(); }
+
+  int argument_count() const {
+    DCHECK(is_inline());
+    return static_cast<int>(inlined_arguments_.size());
+  }
+  int argument_count_without_receiver() const { return argument_count() - 1; }
+
+  bool HasMismatchedArgumentAndParameterCount() {
+    return is_inline() && (argument_count() != parameter_count());
+  }
 
   // The fake offset used as a target for all exits of an inlined function.
   int inline_exit_offset() const {
@@ -2308,11 +2347,10 @@ class MaglevGraphBuilder {
 
   InterpreterFrameState current_interpreter_frame_;
   compiler::FeedbackSource current_speculation_feedback_;
+  SpeculationMode current_speculation_mode_ =
+      SpeculationMode::kAllowSpeculation;
 
-  // TODO(victorgomes): Refactor all inlined data to a
-  // base::Optional<InlinedGraphBuilderData>.
-  // base::Vector<ValueNode*>* inlined_arguments_ = nullptr;
-  base::Optional<base::Vector<ValueNode*>> inlined_arguments_;
+  base::Vector<ValueNode*> inlined_arguments_;
   BytecodeOffset caller_bytecode_offset_;
   ValueNode* inlined_new_target_ = nullptr;
 

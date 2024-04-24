@@ -250,7 +250,11 @@ GOMADIR = detect_goma()
 # Let reclient have precendence over goma.
 IS_GOMA_MACHINE = not RECLIENT_MODE and GOMADIR is not None
 
-RECLIENT_CFG_REL = "../../buildtools/reclient_cfgs/linux"
+if platform.system() == "Linux":
+  RECLIENT_CFG_REL = "../../buildtools/reclient_cfgs/linux"
+else:
+  RECLIENT_CFG_REL = "../../buildtools/reclient_cfgs"
+
 BUILD_DISTRIBUTION_LINE = ""
 if RECLIENT_MODE:
   BUILD_DISTRIBUTION_LINE = "use_remoteexec = true"
@@ -593,9 +597,22 @@ class ManagedConfig(RawConfig):
     return super().build()
 
   def run_tests(self):
+    host_arch = _get_machine()
+    if host_arch == "arm64":
+      if platform.system() == "Darwin" and self.arch != "arm64":
+        # MacOS-arm64 doesn't provide a good experience when users
+        # accidentally try to run x64 tests.
+        print(f"Running {self.arch} tests on Mac-arm64 isn't going to work.")
+        return 1
+      if platform.system() == "Linux" and "arm" not in self.arch:
+        # Assume that an arm64 Linux machine may have been set up to run
+        # arm32 binaries and Android on-device tests; refuse everything else.
+        print(f"Running {self.arch} tests on Linux-arm64 isn't going to work.")
+        return 1
     # Special handling for "mkgrokdump": if it was built, run it.
-    if (self.arch == "x64" and self.mode == "release" and
-        "mkgrokdump" in self.targets):
+    if ("mkgrokdump" in self.targets and self.mode == "release" and
+        (host_arch == "x86_64" and self.arch == "x64") or
+        (host_arch == "arm64" and self.arch == "arm64")):
       mkgrokdump_bin = self.path / "mkgrokdump"
       _call(f"{mkgrokdump_bin} > tools/v8heapconst.py")
     return super().run_tests()

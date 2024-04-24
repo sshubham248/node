@@ -190,29 +190,44 @@ class MjsunitNamesProvider {
   }
 
   // Format: HeapType::* enum value, JS global constant.
-#define ABSTRACT_TYPE_LIST(V)               \
-  V(kAny, kWasmAnyRef)                      \
-  V(kArray, kWasmArrayRef)                  \
-  V(kEq, kWasmEqRef)                        \
-  V(kExn, kWasmExnRef)                      \
-  V(kExtern, kWasmExternRef)                \
-  V(kFunc, kWasmFuncRef)                    \
-  V(kI31, kWasmI31Ref)                      \
-  V(kNone, kWasmNullRef)                    \
-  V(kNoExn, kWasmNullExnRef)                \
-  V(kNoExtern, kWasmNullExternRef)          \
-  V(kNoFunc, kWasmNullFuncRef)              \
-  V(kString, kWasmStringRef)                \
-  V(kStringViewWtf16, kWasmStringViewWtf16) \
-  V(kStringViewWtf8, kWasmStringViewWtf8)   \
-  V(kStringViewIter, kWasmStringViewIter)   \
-  V(kStruct, kWasmStructRef)
+#define ABSTRACT_TYPE_LIST(V)                                     \
+  V(kAny, kWasmAnyRef, kAnyRefCode)                               \
+  V(kArray, kWasmArrayRef, kArrayRefCode)                         \
+  V(kEq, kWasmEqRef, kEqRefCode)                                  \
+  V(kExn, kWasmExnRef, kExnRefCode)                               \
+  V(kExtern, kWasmExternRef, kExternRefCode)                      \
+  V(kFunc, kWasmFuncRef, kFuncRefCode)                            \
+  V(kI31, kWasmI31Ref, kI31RefCode)                               \
+  V(kNone, kWasmNullRef, kNullRefCode)                            \
+  V(kNoExn, kWasmNullExnRef, kNullExnRefCode)                     \
+  V(kNoExtern, kWasmNullExternRef, kNullExternRefCode)            \
+  V(kNoFunc, kWasmNullFuncRef, kNullFuncRefCode)                  \
+  V(kString, kWasmStringRef, kStringRefCode)                      \
+  V(kStringViewWtf16, kWasmStringViewWtf16, kStringViewWtf16Code) \
+  V(kStringViewWtf8, kWasmStringViewWtf8, kStringViewWtf8Code)    \
+  V(kStringViewIter, kWasmStringViewIter, kStringViewIterCode)    \
+  V(kStruct, kWasmStructRef, kStructRefCode)
 
   void PrintHeapType(StringBuilder& out, HeapType type) {
     switch (type.representation()) {
-#define CASE(kCpp, JS) \
-  case HeapType::kCpp: \
-    out << #JS;        \
+#define CASE(kCpp, JS, JSCode) \
+  case HeapType::kCpp:         \
+    out << #JS;                \
+    return;
+      ABSTRACT_TYPE_LIST(CASE)
+#undef CASE
+      case HeapType::kBottom:
+        UNREACHABLE();
+      default:
+        PrintTypeIndex(out, type.ref_index());
+    }
+  }
+
+  void PrintHeapTypeCode(StringBuilder& out, HeapType type) {
+    switch (type.representation()) {
+#define CASE(kCpp, JS, JSCode) \
+  case HeapType::kCpp:         \
+    out << #JSCode;            \
     return;
       ABSTRACT_TYPE_LIST(CASE)
 #undef CASE
@@ -236,7 +251,7 @@ class MjsunitNamesProvider {
       // clang-format on
       case kRefNull:
         switch (type.heap_representation()) {
-#define CASE(kCpp, _) case HeapType::kCpp:
+#define CASE(kCpp, _, _2) case HeapType::kCpp:
           ABSTRACT_TYPE_LIST(CASE)
 #undef CASE
           return PrintHeapType(out, type.heap_type());
@@ -309,7 +324,7 @@ class MjsunitNamesProvider {
     out << "] -> [";
     for (uint32_t i = 0; i < sig->return_count(); i++) {
       if (i > 0) out << ", ";
-      PrintValueType(out, sig->GetParam(i));
+      PrintValueType(out, sig->GetReturn(i));
     }
     out << "]";
   }
@@ -707,6 +722,8 @@ class MjsunitImmediatesPrinter {
       out_ << " kWasmVoid,";
     } else {
       out_ << " ";
+      // TODO(jkummerow): This is not correct, it should prefer the one-byte
+      // "Code" versions (e.g. kNullRefCode instead of kWasmNullRef).
       names()->PrintValueType(out_, imm.sig.GetReturn());
       out_ << ",";
     }
@@ -714,7 +731,7 @@ class MjsunitImmediatesPrinter {
 
   void HeapType(HeapTypeImmediate& imm) {
     out_ << " ";
-    names()->PrintHeapType(out_, imm.type);
+    names()->PrintHeapTypeCode(out_, imm.type);
     out_ << ",";
   }
 
@@ -994,13 +1011,14 @@ class MjsunitModuleDis {
  public:
   MjsunitModuleDis(MultiLineStringBuilder& out, const WasmModule* module,
                    NamesProvider* names, const ModuleWireBytes wire_bytes,
-                   AccountingAllocator* allocator)
+                   AccountingAllocator* allocator, bool has_error = false)
       : out_(out),
         module_(module),
         names_provider_(names),
         mjsunit_names_(module, wire_bytes),
         wire_bytes_(wire_bytes),
-        zone_(allocator, "disassembler") {
+        zone_(allocator, "disassembler"),
+        has_error_(has_error) {
     offsets_.CollectOffsets(module, wire_bytes.module_bytes());
   }
 
@@ -1038,6 +1056,8 @@ class MjsunitModuleDis {
 
     // Types.
     // TODO(14616): Support shared types.
+    // TODO(jkummerow): Support self-referential types, i.e. structs/sigs
+    // that contain a (ref $self).
     uint32_t recgroup_index = 0;
     OffsetsProvider::RecGroup recgroup = offsets_.recgroup(recgroup_index++);
     bool in_explicit_recgroup = false;
@@ -1548,7 +1568,7 @@ class MjsunitModuleDis {
         break;
       case ConstantExpression::kRefNull:
         out_ << "[kExprRefNull, ";
-        names()->PrintHeapType(out_, HeapType(init.repr()));
+        names()->PrintHeapTypeCode(out_, HeapType(init.repr()));
         out_ << "]";
         break;
       case ConstantExpression::kRefFunc:

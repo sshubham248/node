@@ -41,17 +41,12 @@ static_assert((kLiftoffAssemblerFpCacheRegs &
                   .is_empty(),
               "scratch registers must not be used as cache registers");
 
-// rbp-8 holds the stack marker.
-// rbp-16 is the instance parameter.
-constexpr int kInstanceOffset = 16;
-// rbp-24 is the feedback vector.
-constexpr int kFeedbackVectorOffset = 24;
-
 inline constexpr Operand GetStackSlot(int offset) {
   return Operand(rbp, -offset);
 }
 
-constexpr Operand kInstanceDataOperand = GetStackSlot(kInstanceOffset);
+constexpr Operand kInstanceDataOperand =
+    GetStackSlot(WasmLiftoffFrameConstants::kInstanceDataOffset);
 
 constexpr Operand kOSRTargetSlot = GetStackSlot(kOSRTargetOffset);
 
@@ -395,23 +390,6 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      int offset) {
   DCHECK_LE(0, offset);
   LoadTaggedField(dst, Operand(instance, offset));
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, ExternalPointerTag tag,
-                                           Register scratch) {
-  LoadExternalPointerField(dst, Operand(src_addr, offset), tag, scratch,
-                           IsolateRootLocation::kInRootRegister);
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, Register index,
-                                           ExternalPointerTag tag,
-                                           Register scratch) {
-  MemOperand src_op = liftoff::GetMemOp(this, src_addr, index, offset,
-                                        times_external_pointer_size);
-  LoadExternalPointerField(dst, src_op, tag, scratch,
-                           IsolateRootLocation::kInRootRegister);
 }
 
 void LiftoffAssembler::SpillInstanceData(Register instance) {
